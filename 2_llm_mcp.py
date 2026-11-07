@@ -11,18 +11,22 @@ from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classifica
 import json
 import re
 
+from pathlib import Path
+from dotenv import load_dotenv
+from openai import OpenAI
+
 warnings.filterwarnings("ignore")
 
-def call_llm_fn(prompt: str) -> str:
-    # Replace with your actual OpenAI/LLM client call.
-    # Must return raw text from the model. This is just a placeholder (that allows you to run the code).
-    return """{
-  "routes": ["diabetes", "heart"],
-  "primary": "heart",
-  "confidence": {"diabetes": 0.35, "heart": 0.72, "breast_cancer": 0.05},
-  "notes": "Brief triage rationale."
-}"""
+load_dotenv(Path(__file__).parent / "SECRETS")
+client = OpenAI()
 
+def call_llm_fn(prompt: str) -> str:
+    response = client.responses.create(
+        model="gpt-6-luna",
+        input=prompt,
+        reasoning={"effort": "low"},
+    )
+    return response.output_text
 
 def make_case_text(pid, d_row, b_row, h_row):
     # d_row, b_row, h_row are 1D arrays (same as you pass to models)
@@ -105,6 +109,53 @@ class LLMPlannerAgent(BaseAgent):
             prompt = payload["text"]
 
             # Call LLM and parse response
+            response = self.call_llm(prompt)
+
+            error = None
+            try:
+                decision = self._extract_json(response)
+                routes = decision.get("routes")
+                primary = decision.get("primary")
+
+                # Validate that routes is a non-empty list
+                if not isinstance(routes, list) or not routes:
+                    raise ValueError("Expected a list of routes.")
+
+                # Validate that each disease in routes is a string and a key in payload["data"]
+                for disease in routes:
+                    if not isinstance(disease, str) or disease not in payload["data"]:
+                        raise ValueError(f"Unknown route {disease!r}.")
+                    
+                # Validate that primary is in routes
+                if primary not in routes:
+                    raise ValueError("The primary concern must be one of the selected routes.")
+
+                routes = list(dict.fromkeys(routes))
+                print(f"Patient {pid} decision:", decision)
+
+            except ValueError as exc:
+                routes = []
+                primary = None
+                error = str(exc)
+                print(f"Patient {pid} triage failed:", error)
+
+            self.model.triage_log.append({
+                "PatientID": pid,
+                "routes": routes,
+                "primary": primary,
+                "labels": payload["labels"],
+                "error": error
+            })
+
+            for disease in routes:
+                task_id = f"task_{disease}_{pid}"
+                self.model.context[task_id] = {
+                    "id": pid,
+                    "description": f"Analyze {disease} data",
+                    "data": payload["data"][disease],
+                    "y_true": int(payload["labels"][disease]),
+                    "triage": {"primary": primary}
+                }
 
             # store triage decision in model context
             # self.model.triage_log.append({
@@ -255,7 +306,7 @@ for step in range(3):
     model.step()
 
 # ==========================================
-# STEP 5: Visualize Results with Seaborn
+# STEP 5: Visualize Results
 # ==========================================
 
 # TODO: implement the analysis and visualization of results yourself. Below is just a starting point.
@@ -264,11 +315,48 @@ results_df = pd.DataFrame(model.results)
 print("Results Collected:", len(results_df))
 print(results_df.head())
 
-
-
-
 # Analyse the triage performance
 
 triage_df = pd.DataFrame(model.triage_log)
 print("Triage Collected:", len(triage_df))
 print(triage_df.head())
+
+positive_labels = {"diabetes": 1, "heart": 1, "breast_cancer": 0}
+scores = {}
+
+for disease, positive_label in positive_labels.items():
+    selected = triage_df["routes"].apply(lambda routes: disease in routes)
+    positive = triage_df["labels"].apply(lambda labels: labels[disease] == positive_label)
+
+    scores[disease] = {
+        "Precision": positive[selected].mean(),
+        "Recall": selected[positive].mean(),
+    }
+
+scores_df = pd.DataFrame.from_dict(scores, orient="index")
+print(scores_df.round(3).to_string(na_rep="N/A"))
+
+output_dir = Path("results")
+output_dir.mkdir(exist_ok=True)
+
+ax = scores_df.plot(style=["o", "x"], ylim=(-0.05, 1.05), ylabel="Score")
+ax.figure.savefig(output_dir / "llm_triage_metrics.png", bbox_inches="tight")
+plt.close(ax.figure)
+
+for disease, positive_label in positive_labels.items():
+    if results_df.empty or disease not in results_df["Disease"].values:
+        print(f"{disease}: no executor predictions.")
+        continue
+
+    rows = results_df[results_df["Disease"] == disease]
+    display = ConfusionMatrixDisplay.from_predictions(
+        rows["y_true"],
+        rows["y_pred"],
+        labels=[1 - positive_label, positive_label],
+        display_labels=["Negative", "Positive"],
+    )
+    display.ax_.set_title(disease)
+    display.figure_.savefig(
+        output_dir / f"llm_confusion_{disease}.png", bbox_inches="tight"
+    )
+    plt.close(display.figure_)
