@@ -321,7 +321,7 @@ triage_df = pd.DataFrame(model.triage_log)
 print("Triage Collected:", len(triage_df))
 print(triage_df.head())
 
-positive_labels = {"diabetes": 1, "heart": 1, "breast_cancer": 0}
+positive_labels = {"diabetes": 1, "heart": 0, "breast_cancer": 0}
 scores = {}
 
 for disease, positive_label in positive_labels.items():
@@ -338,10 +338,6 @@ print(scores_df.round(3).to_string(na_rep="N/A"))
 
 output_dir = Path("results")
 output_dir.mkdir(exist_ok=True)
-
-ax = scores_df.plot(style=["o", "x"], ylim=(-0.05, 1.05), ylabel="Score")
-ax.figure.savefig(output_dir / "llm_triage_metrics.png", bbox_inches="tight")
-plt.close(ax.figure)
 
 for disease, positive_label in positive_labels.items():
     if results_df.empty or disease not in results_df["Disease"].values:
